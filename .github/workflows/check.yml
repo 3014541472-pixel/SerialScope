@@ -1,0 +1,29 @@
+name: Software and firmware checks
+on: [push, pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p test_protocol.py -v
+      - run: python -m compileall -q main.py serial_manager.py data_parser.py
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        demo: ['ON', 'OFF']
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi
+      - run: cmake -S firmware -B build -DCMAKE_TOOLCHAIN_FILE=cmake/arm-gcc.cmake -DDEMO_MODE=${{ matrix.demo }}
+      - run: cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-demo-${{ matrix.demo }}
+          path: |
+            build/serialscope.elf
+            build/serialscope.bin

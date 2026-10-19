@@ -1,40 +1,20 @@
+"""SerialScope wire protocol: DEVICE_DATA,ID=<sequence>,VALUE=<number> LF."""
+import math
+import re
+
+FRAME = re.compile(r'DEVICE_DATA,ID=([0-9]+),VALUE=([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)')
+
 
 def parse_sensor_data(data):
-    """
-    Parse sensor data received from a device.
-
-    Expected format:
-    DEVICE_DATA,ID=1,VALUE=26.50
-    """
-
-    try:
-        parts = data.strip().split(",")
-
-        if len(parts) != 3:
-            return None
-
-        if parts[0] != "DEVICE_DATA":
-            return None
-
-        sensor_id = int(parts[1].split("=")[1])
-        value = float(parts[2].split("=")[1])
-
-        return {
-            "sensor_id": sensor_id,
-            "value": value
-        }
-
-    except (ValueError, IndexError):
+    if not isinstance(data, str) or len(data) > 256:
         return None
-
-
-if __name__ == "__main__":
-    test_data = "DEVICE_DATA,ID=8,VALUE=32.75"
-
-    result = parse_sensor_data(test_data)
-
-    if result:
-        print("Sensor ID:", result["sensor_id"])
-        print("Sensor Value:", result["value"])
-    else:
-        print("Invalid data")
+    match = FRAME.fullmatch(data.strip())
+    if match is None:
+        return None
+    try:
+        sequence, value = int(match[1]), float(match[2])
+        if not math.isfinite(value):
+            return None
+        return {'sensor_id': sequence, 'value': value}
+    except ValueError:
+        return None

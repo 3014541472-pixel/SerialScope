@@ -16,3 +16,10 @@ venv/
 # System files
 .DS_Store
 Thumbs.db
+
+build/
+.venv/
+__pycache__/
+*.elf
+*.bin
+*.map

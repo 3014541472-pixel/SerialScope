@@ -1,464 +1,205 @@
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import math
+"""SerialScope: simulation and real serial acquisition, without blocking reads."""
 import csv
+import math
+import tkinter as tk
+from collections import deque
 from datetime import datetime
-
+from tkinter import ttk, filedialog, messagebox
+import serial
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
 from data_parser import parse_sensor_data
+from serial_manager import SerialManager
 
 
 class SerialScope:
+    LIMIT = 100000
 
     def __init__(self, root):
         self.root = root
-        self.root.title("SerialScope 4.0")
-        self.root.geometry("1150x750")
-
-        # Simulation settings
-        self.sample = 0
-        self.running = False
-
-        # Data storage
-        self.x_data = []
-        self.y_data = []
-        self.logs = []
-        self.csv_data = []
-
-        # Statistics
-        self.rx_count = 0
-        self.tx_count = 0
-
-        self.build_interface()
-
-    # -------------------------------
-    # Build user interface
-    # -------------------------------
-
-    def build_interface(self):
-
-        title = tk.Label(
-            self.root,
-            text="SerialScope 4.0",
-            font=("Arial", 20, "bold")
-        )
-        title.pack(pady=10)
-
-        subtitle = tk.Label(
-            self.root,
-            text="Serial Data Monitoring and Visualization",
-            font=("Arial", 10)
-        )
-        subtitle.pack()
-
-        # Control buttons
-        control_frame = tk.Frame(self.root)
-        control_frame.pack(fill="x", padx=15, pady=10)
-
-        ttk.Button(
-            control_frame,
-            text="Start Simulation",
-            command=self.start_simulation
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            control_frame,
-            text="Stop Simulation",
-            command=self.stop_simulation
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            control_frame,
-            text="Clear",
-            command=self.clear_data
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            control_frame,
-            text="Save Log",
-            command=self.save_log
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            control_frame,
-            text="Export CSV",
-            command=self.export_csv
-        ).pack(side="left", padx=5)
-
-        self.status_label = tk.Label(
-            control_frame,
-            text="Status: Stopped",
-            fg="red"
-        )
-        self.status_label.pack(side="right", padx=10)
-
-        # Statistics
-        stats_frame = tk.Frame(self.root)
-        stats_frame.pack(fill="x", padx=20, pady=5)
-
-        self.rx_label = tk.Label(
-            stats_frame,
-            text="RX: 0",
-            font=("Arial", 12, "bold")
-        )
-        self.rx_label.pack(side="left", padx=15)
-
-        self.tx_label = tk.Label(
-            stats_frame,
-            text="TX: 0",
-            font=("Arial", 12, "bold")
-        )
-        self.tx_label.pack(side="left", padx=15)
-
-        # Main content
-        content = tk.Frame(self.root)
-        content.pack(fill="both", expand=True, padx=15, pady=10)
-
-        # Chart
-        plot_frame = tk.LabelFrame(
-            content,
-            text="Real-time Sensor Data"
-        )
-        plot_frame.pack(
-            side="left",
-            fill="both",
-            expand=True
-        )
-
-        self.figure = Figure(figsize=(6, 4), dpi=100)
-        self.ax = self.figure.add_subplot(111)
-
-        self.ax.set_title("Sensor Data")
-        self.ax.set_xlabel("Sample Number")
-        self.ax.set_ylabel("Sensor Value")
+        root.title('SerialScope — STM32 Data Monitor')
+        root.geometry('1100x750')
+        self.manager = SerialManager()
+        self.mode = 'stopped'
+        self.sample = self.rx_count = self.tx_count = self.invalid = 0
+        self.points = deque(maxlen=200)
+        self.records = deque(maxlen=self.LIMIT)
+        self.logs = deque(maxlen=2000)
+        self.port = tk.StringVar()
+        self.baud = tk.StringVar(value='115200')
+        self.status = tk.StringVar(value='Stopped')
+        self.stats = tk.StringVar()
+        top = ttk.Frame(root, padding=10)
+        top.pack(fill='x')
+        self.ports = ttk.Combobox(top, textvariable=self.port, width=18)
+        self.ports.pack(side='left')
+        for label, command in [('Refresh', self.refresh)]:
+            ttk.Button(top, text=label, command=command).pack(side='left', padx=3)
+        ttk.Combobox(top, textvariable=self.baud, values=['9600', '19200', '57600', '115200'], width=9).pack(side='left')
+        for label, command in [('Connect', self.connect), ('Stop / Disconnect', self.stop),
+                               ('Simulate', self.simulate), ('Clear', self.clear)]:
+            ttk.Button(top, text=label, command=command).pack(side='left', padx=3)
+        ttk.Label(root, textvariable=self.status).pack()
+        ttk.Label(root, textvariable=self.stats).pack()
+        figure = Figure(figsize=(8, 4), dpi=100)
+        self.ax = figure.add_subplot(111)
+        self.ax.set(xlabel='Sequence (ID)', ylabel='Value (V for supplied ADC firmware)', title='Latest 200 samples')
         self.ax.grid(True)
+        self.line, = self.ax.plot([], [])
+        self.canvas = FigureCanvasTkAgg(figure, master=root)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.log_box = tk.Text(root, height=9, state='disabled')
+        self.log_box.pack(fill='x', padx=10)
+        bottom = ttk.Frame(root, padding=10)
+        bottom.pack(fill='x')
+        self.entry = ttk.Entry(bottom)
+        self.entry.pack(side='left', fill='x', expand=True)
+        for label, command in [('Send', self.send), ('Export CSV', self.export), ('Save Log', self.save_log)]:
+            ttk.Button(bottom, text=label, command=command).pack(side='left', padx=3)
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        self.refresh()
+        self.update_stats()
+        self.timer = root.after(50, self.poll)
 
-        self.line, = self.ax.plot(
-            [], [],
-            label="Sensor Value"
-        )
+    def log(self, message):
+        line = f'[{datetime.now().isoformat(timespec="seconds")}] {message}'
+        self.logs.append(line)
+        self.log_box.configure(state='normal')
+        self.log_box.insert('end', line + '\n')
+        # Bound visible log as well as in-memory log.
+        if int(self.log_box.index('end-1c').split('.')[0]) > 201:
+            self.log_box.delete('1.0', '2.0')
+        self.log_box.see('end')
+        self.log_box.configure(state='disabled')
 
-        self.ax.legend()
+    def update_stats(self):
+        self.stats.set(f'Valid frames: {self.rx_count} | Invalid frames: {self.invalid} | Sent messages: {self.tx_count} | Saved samples: {len(self.records)} / {self.LIMIT}')
 
-        self.canvas = FigureCanvasTkAgg(
-            self.figure,
-            master=plot_frame
-        )
+    def refresh(self):
+        try:
+            ports = self.manager.list_ports()
+            self.ports['values'] = ports
+            if ports and not self.port.get():
+                self.port.set(ports[0])
+        except (OSError, serial.SerialException) as error:
+            self.log(f'Port scan: {error}')
 
-        self.canvas.get_tk_widget().pack(
-            fill="both",
-            expand=True
-        )
+    def stop(self):
+        self.mode = 'stopped'
+        try:
+            self.manager.disconnect()
+        except (OSError, serial.SerialException) as error:
+            self.log(f'Disconnect: {error}')
+        self.status.set('Stopped')
 
-        # Receive monitor
-        log_frame = tk.LabelFrame(
-            content,
-            text="Receive Monitor"
-        )
-        log_frame.pack(
-            side="right",
-            fill="both",
-            expand=True,
-            padx=10
-        )
-
-        self.log_box = tk.Text(
-            log_frame,
-            width=45,
-            font=("Consolas", 10)
-        )
-
-        self.log_box.pack(
-            fill="both",
-            expand=True
-        )
-
-        # Send area
-        send_frame = tk.LabelFrame(
-            self.root,
-            text="Send Data (Simulation Only)"
-        )
-        send_frame.pack(
-            fill="x",
-            padx=15,
-            pady=10
-        )
-
-        self.send_entry = ttk.Entry(send_frame)
-        self.send_entry.pack(
-            side="left",
-            fill="x",
-            expand=True,
-            padx=10,
-            pady=10
-        )
-
-        ttk.Button(
-            send_frame,
-            text="Send",
-            command=self.send_data
-        ).pack(side="right", padx=10)
-
-    # -------------------------------
-    # Logging
-    # -------------------------------
-
-    def add_log(self, message):
-
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        log_line = f"[{timestamp}] {message}"
-
-        self.logs.append(log_line)
-
-        self.log_box.insert(
-            tk.END,
-            log_line + "\n"
-        )
-
-        self.log_box.see(tk.END)
-
-    # -------------------------------
-    # Start simulation
-    # -------------------------------
-
-    def start_simulation(self):
-
-        if self.running:
+    def connect(self):
+        self.stop()
+        if not self.port.get().strip():
+            messagebox.showerror('Connection', 'Select a serial port first.')
             return
-
-        self.running = True
-
-        self.status_label.config(
-            text="Status: Running (Simulation)",
-            fg="green"
-        )
-
-        self.add_log("Simulation started")
-
-        self.update_plot()
-
-    # -------------------------------
-    # Stop simulation
-    # -------------------------------
-
-    def stop_simulation(self):
-
-        self.running = False
-
-        self.status_label.config(
-            text="Status: Stopped",
-            fg="red"
-        )
-
-        self.add_log("Simulation stopped")
-
-    # -------------------------------
-    # Generate and parse data
-    # -------------------------------
-
-    def update_plot(self):
-
-        if not self.running:
-            return
-
-        self.sample += 1
-
-        # Generate raw sensor data
-        raw_data = (
-            f"DEVICE_DATA,ID={self.sample},"
-            f"VALUE={25 + 5 * math.sin(self.sample * 0.2):.2f}"
-        )
-
-        # Parse raw data
-        result = parse_sensor_data(raw_data)
-
-        if result is not None:
-
-            sensor_id = result["sensor_id"]
-            value = result["value"]
-
-            # Store parsed data
-            self.x_data.append(sensor_id)
-            self.y_data.append(value)
-
-            self.csv_data.append([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                sensor_id,
-                value
-            ])
-
-            # Keep the latest 50 points
-            if len(self.x_data) > 50:
-                self.x_data.pop(0)
-                self.y_data.pop(0)
-
-            # Update chart
-            self.line.set_data(
-                self.x_data,
-                self.y_data
-            )
-
-            self.ax.relim()
-            self.ax.autoscale_view()
-
-            self.canvas.draw_idle()
-
-            # Update RX
-            self.rx_count += 1
-
-            self.rx_label.config(
-                text=f"RX: {self.rx_count}"
-            )
-
-            # Update log
-            self.add_log(
-                f"Received ID={sensor_id}, VALUE={value:.2f}"
-            )
-
+        ok, detail = self.manager.connect(self.port.get().strip(), self.baud.get())
+        self.log(detail)
+        if ok:
+            self.mode = 'serial'
+            self.status.set(f'Real serial: {self.port.get()} / {self.baud.get()} baud, 8N1')
         else:
+            messagebox.showerror('Connection failed', detail)
 
-            self.add_log("Invalid sensor data")
+    def simulate(self):
+        self.stop()
+        self.mode = 'simulation'
+        self.status.set('Simulation — generated values, not hardware measurements')
+        self.log('Simulation started')
 
-        self.root.after(
-            200,
-            self.update_plot
-        )
+    def accept(self, raw):
+        parsed = parse_sensor_data(raw)
+        if parsed is None:
+            self.invalid += 1
+            self.log(f'Invalid frame: {raw[:100]}')
+            return
+        self.rx_count += 1
+        self.points.append((parsed['sensor_id'], parsed['value']))
+        self.records.append((datetime.now().isoformat(timespec='milliseconds'), self.mode,
+                             parsed['sensor_id'], parsed['value']))
+        self.log(f'{self.mode}: {raw}')
 
-    # -------------------------------
-    # Send simulated data
-    # -------------------------------
+    def poll(self):
+        try:
+            if self.mode == 'simulation':
+                self.sample += 1
+                self.accept(f'DEVICE_DATA,ID={self.sample},VALUE={1.65 + math.sin(self.sample * .1):.3f}')
+            elif self.mode == 'serial':
+                for raw in self.manager.read_lines():
+                    self.accept(raw)
+            if self.points:
+                x, y = zip(*self.points)
+                self.line.set_data(x, y)
+                self.ax.relim()
+                self.ax.autoscale_view()
+                self.canvas.draw_idle()
+            self.update_stats()
+        except (serial.SerialException, OSError) as error:
+            self.log(f'Serial error: {error}; reconnect with Connect')
+            self.stop()
+        finally:
+            self.timer = self.root.after(50, self.poll)
 
-    def send_data(self):
+    def send(self):
+        text = self.entry.get().strip()
+        if not text:
+            return
+        if self.mode != 'serial':
+            self.log('Send requires a real serial connection')
+            return
+        try:
+            if self.manager.send_data(text):
+                self.tx_count += 1
+                self.log(f'TX: {text}')
+                self.entry.delete(0, 'end')
+                self.update_stats()
+        except (serial.SerialException, OSError) as error:
+            self.log(f'Send failed: {error}')
+            self.stop()
 
-        message = self.send_entry.get().strip()
-
-        if message:
-
-            self.tx_count += 1
-
-            self.tx_label.config(
-                text=f"TX: {self.tx_count}"
-            )
-
-            self.add_log(
-                f"TX: {message} (simulated only)"
-            )
-
-            self.send_entry.delete(0, tk.END)
-
-    # -------------------------------
-    # Clear data
-    # -------------------------------
-
-    def clear_data(self):
-
-        self.x_data.clear()
-        self.y_data.clear()
-        self.csv_data.clear()
-
-        self.sample = 0
-        self.rx_count = 0
-        self.tx_count = 0
-
-        self.rx_label.config(text="RX: 0")
-        self.tx_label.config(text="TX: 0")
-
+    def clear(self):
+        self.points.clear()
+        self.records.clear()
         self.logs.clear()
-
-        self.log_box.delete(
-            "1.0",
-            tk.END
-        )
-
+        self.rx_count = self.tx_count = self.invalid = 0
         self.line.set_data([], [])
-
-        self.ax.relim()
-        self.ax.autoscale_view()
-
         self.canvas.draw_idle()
+        self.log_box.configure(state='normal')
+        self.log_box.delete('1.0', 'end')
+        self.log_box.configure(state='disabled')
+        self.update_stats()
 
-    # -------------------------------
-    # Save log
-    # -------------------------------
+    def export(self):
+        path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV', '*.csv')])
+        if path:
+            try:
+                with open(path, 'w', newline='', encoding='utf-8-sig') as output:
+                    writer = csv.writer(output)
+                    writer.writerow(['timestamp', 'source', 'sequence_id', 'value'])
+                    writer.writerows(self.records)
+            except OSError as error:
+                messagebox.showerror('Export failed', str(error))
 
     def save_log(self):
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[
-                ("Text Files", "*.txt")
-            ]
-        )
-
+        path = filedialog.asksaveasfilename(defaultextension='.txt', filetypes=[('Text', '*.txt')])
         if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as output:
+                    output.write('\n'.join(self.logs))
+            except OSError as error:
+                messagebox.showerror('Save failed', str(error))
 
-            with open(
-                path,
-                "w",
-                encoding="utf-8"
-            ) as file:
-
-                file.write(
-                    "\n".join(self.logs)
-                )
-
-            messagebox.showinfo(
-                "Success",
-                "Log saved successfully!"
-            )
-
-    # -------------------------------
-    # Export CSV
-    # -------------------------------
-
-    def export_csv(self):
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[
-                ("CSV Files", "*.csv")
-            ]
-        )
-
-        if path:
-
-            with open(
-                path,
-                "w",
-                newline="",
-                encoding="utf-8-sig"
-            ) as file:
-
-                writer = csv.writer(file)
-
-                writer.writerow([
-                    "Timestamp",
-                    "Sensor ID",
-                    "Sensor Value"
-                ])
-
-                writer.writerows(
-                    self.csv_data
-                )
-
-            messagebox.showinfo(
-                "Success",
-                "CSV exported successfully!"
-            )
+    def close(self):
+        self.root.after_cancel(self.timer)
+        self.stop()
+        self.root.destroy()
 
 
-# -------------------------------
-# Main program
-# -------------------------------
-
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     root = tk.Tk()
-
-    app = SerialScope(root)
-
+    SerialScope(root)
     root.mainloop()
